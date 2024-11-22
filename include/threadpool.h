@@ -5,6 +5,7 @@
 #include<functional>
 #include<mutex>
 #include<condition_variable>
+#include<future>
 
 class ThreadPool{
     private:
@@ -18,32 +19,49 @@ class ThreadPool{
         ThreadPool(int numThreads):numThreads(numThreads), stop(false){
             for(int i=0; i<numThreads; i++){
                 threads.emplace_back([this]{
-                    std::function<void()> task;
-                    std::unique_lock<std::mutex> lock(mtx);
-                    cv.wait(lock, [this](){
-                        return  !tasks.empty() || stop;
-                    });
-                    if(stop && tasks.empty()){
-                        return;
+                    while(true){
+                        std::function<void()> task;
+                        {
+                            std::unique_lock<std::mutex> lock(mtx);
+                            cv.wait(lock, [this](){
+                                return  !tasks.empty() || stop;
+                            });
+                            if(stop && tasks.empty()){
+                                return;
+                            }
+                            task = std::move(tasks.front());
+                            tasks.pop();
+                        }
+                        try{
+                            task();
+                        }
+                        catch(const std::exception& e){
+                            std::cerr<<"Task threw an exception: "<<e.what()<<"\n";
+                        }
+                        catch(...){
+                            std::cerr<<"Task threw an unknown exception.\n";
+                        }
                     }
-                    task = std::move(tasks.front());
-                    tasks.pop();
-                    lock.unlock();
-                    task();
                 });
             }
         }
-        void executeTask(std::function<void()> task){
+        template<class F, class... Args>
+        auto executeTask(F&& func, Args&&... args)->std::future<decltype(func(args...))>{
+            using return_type = decltype(func(args...));
+            auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(func), std::forward<Args>(args)...));
+            std::future<return_type> res = task->get_future();
             {
-            std::unique_lock<std::mutex> lock(mtx);
-            tasks.push(task);
+                std::unique_lock<std::mutex> lock(mtx);
+                tasks.emplace([task](){(*task)();});
             }
             cv.notify_one();
+            return res;
         }
         ~ThreadPool(){
-            std::unique_lock<std::mutex> lock(mtx);
-            stop = true;
-            lock.unlock();
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                stop = true;
+            }
             cv.notify_all();
             for(auto &th: threads){
                 th.join();
